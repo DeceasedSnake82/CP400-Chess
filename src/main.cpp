@@ -31,7 +31,7 @@
 APP_NAME("Chess")
 APP_DESCRIPTION("A simple chess ai to play against")
 APP_AUTHOR("DeceasedSnake82")
-APP_VERSION("1.1.0")
+APP_VERSION("1.1.1")
 
 // ----------------------------------------------------------------------------
 // Sprites (16x16, 1bpp packed into 16 bits/row, bit 15 = leftmost pixel)
@@ -729,6 +729,9 @@ struct TTEntry {
 };
 static TTEntry* tt = nullptr;
 
+// Global array to store Killer Moves (up to max ply depth of 64)
+static Move killerMoves[64][2];
+
 static uint64_t zobristPieces[64][16];
 static uint64_t zobristSide;
 static uint64_t zobristCastle[16];
@@ -766,23 +769,33 @@ static uint64_t computeHash(const Board& b) {
 static int nodesSearched = 0;
 static const int MATE_SCORE = 30000;
 
-static inline int moveScore(const Board& b, const Move& m, const Move& ttMove, bool hasTT) {
+static inline int moveScore(const Board& b, const Move& m, const Move& ttMove, bool hasTT, int ply) {
+    // 1. Principal Variation / Transposition Table Move
     if (hasTT && m.from == ttMove.from && m.to == ttMove.to && m.promo == ttMove.promo) return 1000000;
+    
     int s = 0;
     if (m.flags & MFLAG_CAPTURE) {
+        // 2. Good Captures (MVV-LVA)
         uint8_t victim = b.sq[m.to];
         int victimType = (m.flags & MFLAG_EP) ? PT_PAWN : (isEmpty(victim) ? 0 : pieceType(victim));
         uint8_t attacker = b.sq[m.from];
         int attackerType = pieceType(attacker);
         s += 100000 + pieceValue[victimType] * 16 - pieceValue[attackerType];
+    } else if (ply < 64) {
+        // 3. Killer Moves (non-captures that caused recent branch alpha cuts)
+        if (m.from == killerMoves[ply][0].from && m.to == killerMoves[ply][0].to && m.promo == killerMoves[ply][0].promo) return 90000;
+        if (m.from == killerMoves[ply][1].from && m.to == killerMoves[ply][1].to && m.promo == killerMoves[ply][1].promo) return 80000;
     }
+    
     if (m.promo == PT_QUEEN) s += 90000;
     return s;
 }
 
-static void sortMoves(Board& b, MoveList& ml, const Move& ttMove, bool hasTT) {
+static void sortMoves(Board& b, MoveList& ml, const Move& ttMove, bool hasTT, int ply) {
     int scores[256];
-    for (int i = 0; i < ml.count; ++i) scores[i] = moveScore(b, ml.moves[i], ttMove, hasTT);
+    for (int i = 0; i < ml.count; ++i) scores[i] = moveScore(b, ml.moves[i], ttMove, hasTT, ply);
+    
+    // Insertion sort: efficient for small hardware pipelines with short lists
     for (int i = 1; i < ml.count; ++i) {
         Move mv = ml.moves[i];
         int sc = scores[i];
@@ -797,33 +810,43 @@ static void sortMoves(Board& b, MoveList& ml, const Move& ttMove, bool hasTT) {
     }
 }
 
-static int quiescence(Board& b, int alpha, int beta, int side) {
+static int quiescence(Board& b, int alpha, int beta, int side, int ply) {
     nodesSearched++;
     int standPat = evaluate(b) * (side == COL_WHITE ? 1 : -1);
     if (standPat >= beta) return beta;
     if (standPat > alpha) alpha = standPat;
 
     MoveList ml;
-    genLegalMoves(b, ml);
+    genPseudoMoves(b, ml); // Changed to PseudoMoves for optimal sorting speedup[cite: 1]
     Move dummy{}; 
-    sortMoves(b, ml, dummy, false);
+    sortMoves(b, ml, dummy, false, ply);
+    
     for (int i = 0; i < ml.count; ++i) {
         if (!(ml.moves[i].flags & MFLAG_CAPTURE)) continue;
+        
         Undo u;
         makeMove(b, ml.moves[i], u);
-        int score = -quiescence(b, -beta, -alpha, 1 - side);
+        
+        // Lazy Legality Check[cite: 1]
+        if (isSquareAttacked(b, b.kingSq[side], 1 - side)) {
+            unmakeMove(b, u);
+            continue; 
+        }
+        
+        int score = -quiescence(b, -beta, -alpha, 1 - side, ply + 1);
         unmakeMove(b, u);
+        
         if (score >= beta) return beta;
         if (score > alpha) alpha = score;
     }
     return alpha;
 }
 
-static int negamax(Board& b, int depth, int alpha, int beta, int side, Move* outBest) {
+static int negamax(Board& b, int depth, int alpha, int beta, int side, Move* outBest, int ply) {
     nodesSearched++;
     uint64_t hash = computeHash(b);
     uint32_t idx = (uint32_t)(hash & (TT_SIZE - 1));
-    Move ttMove; bool hasTT = false;
+    Move ttMove{}; bool hasTT = false;
     int origAlpha = alpha;
 
     if (tt[idx].used && tt[idx].key == hash && tt[idx].depth >= depth) {
@@ -839,37 +862,74 @@ static int negamax(Board& b, int depth, int alpha, int beta, int side, Move* out
     }
 
     if (depth <= 0) {
-        return quiescence(b, alpha, beta, side);
+        return quiescence(b, alpha, beta, side, ply);
+    }
+
+    // NULL MOVE PRUNING: Avoid searching bad trees if passing a turn doesn't break beta
+    if (depth >= 3 && !inCheck(b, side) && ply > 0) {
+        int ep_cache = b.epSquare;
+        b.epSquare = -1;
+        b.sideToMove = 1 - side;
+        
+        int nullScore = -negamax(b, depth - 3, -beta, -beta + 1, 1 - side, nullptr, ply + 1);
+        
+        b.sideToMove = side;
+        b.epSquare = ep_cache;
+        
+        if (nullScore >= beta) return beta;
     }
 
     MoveList ml;
-    genLegalMoves(b, ml);
-    if (ml.count == 0) {
-        if (inCheck(b, b.sideToMove)) return -MATE_SCORE - depth; 
-        return 0; 
-    }
+    genPseudoMoves(b, ml); // Core improvement: Use pseudo moves during search iterations[cite: 1]
 
-    sortMoves(b, ml, ttMove, hasTT);
+    sortMoves(b, ml, ttMove, hasTT, ply);
 
     int best = -MATE_SCORE * 2;
-    Move bestMove = ml.moves[0];
+    Move bestMove = ml.count > 0 ? ml.moves[0] : Move{};
+    int legalMovesFound = 0;
+
     for (int i = 0; i < ml.count; ++i) {
         Undo u;
         makeMove(b, ml.moves[i], u);
-        int score = -negamax(b, depth - 1, -beta, -alpha, 1 - side, nullptr);
+        
+        // Lazy Legality Check[cite: 1]
+        if (isSquareAttacked(b, b.kingSq[side], 1 - side)) {
+            unmakeMove(b, u);
+            continue; 
+        }
+        legalMovesFound++;
+
+        int score = -negamax(b, depth - 1, -beta, -alpha, 1 - side, nullptr, ply + 1);
         unmakeMove(b, u);
+
         if (score > best) {
             best = score;
             bestMove = ml.moves[i];
         }
         if (best > alpha) alpha = best;
-        if (alpha >= beta) break; 
+        
+        // Beta Cutoff
+        if (alpha >= beta) {
+            // Log Killer Move if the cutoff wasn't a tactical capture[cite: 1]
+            if (!(ml.moves[i].flags & MFLAG_CAPTURE) && ply < 64) {
+                killerMoves[ply][1] = killerMoves[ply][0];
+                killerMoves[ply][0] = ml.moves[i];
+            }
+            break; 
+        }
+    }
+
+    // Native Checkmate and Stalemate resolution inside pseudo loop
+    if (legalMovesFound == 0) {
+        if (inCheck(b, side)) return -MATE_SCORE + ply; 
+        return 0; 
     }
 
     uint8_t flag;
     if (best <= origAlpha) flag = TT_UPPER;
     else if (best >= beta) flag = TT_LOWER;
     else flag = TT_EXACT;
+    
     tt[idx].used = true;
     tt[idx].key = hash;
     tt[idx].score = (int16_t)best;
@@ -891,6 +951,9 @@ static Move searchBestMove(Board& b, int maxDepth) {
     genLegalMoves(b, ml);
     if (ml.count > 0) best = ml.moves[0];
     nodesSearched = 0;
+
+    // Reset Killer moves before starting a root-node cycle
+    Mem_Memset(killerMoves, 0, sizeof(killerMoves));
 
     int lastScore = evaluate(b) * (side == COL_WHITE ? 1 : -1);
 
@@ -938,7 +1001,8 @@ static Move searchBestMove(Board& b, int maxDepth) {
         LCD_Refresh();
 
         Move iterBest;
-        int currentScore = negamax(b, d, -MATE_SCORE * 2, MATE_SCORE * 2, side, &iterBest);
+        // Modified with explicit ply parameter tracking (0 at search root node)[cite: 1]
+        int currentScore = negamax(b, d, -MATE_SCORE * 2, MATE_SCORE * 2, side, &iterBest, 0);
         lastScore = currentScore;
         best = iterBest;
     }
@@ -1259,7 +1323,7 @@ int main() {
                         if (botDepth > 1) botDepth--;
                         drawMenu();
                     } else if (btnDepthPlus.contains(tx, ty)) {
-                        if (botDepth < 6) botDepth++;
+                        if (botDepth < 9) botDepth++;
                         drawMenu();
                     } else if (btnStart.contains(tx, ty)) {
                         resetGame();
