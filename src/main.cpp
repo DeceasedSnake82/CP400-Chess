@@ -31,7 +31,7 @@
 APP_NAME("Chess")
 APP_DESCRIPTION("A simple chess ai to play against")
 APP_AUTHOR("DeceasedSnake82")
-APP_VERSION("1.0.1")
+APP_VERSION("1.1.0")
 
 // ----------------------------------------------------------------------------
 // Sprites (16x16, 1bpp packed into 16 bits/row, bit 15 = leftmost pixel)
@@ -1013,7 +1013,11 @@ static void drawMenu() {
     LCD_Refresh();
 }
 
-static inline int screenXtoFile(int x) { return (x - boardOriginX) / squareSize; }
+static inline int screenXtoFile(int x, bool playerIsWhite) {
+    int col = (x - boardOriginX) / squareSize;
+    return playerIsWhite ? col : (7 - col);
+}
+
 static inline int screenYtoRank(int y, bool playerIsWhite) {
     int row = (y - boardOriginY) / squareSize;
     return playerIsWhite ? (7 - row) : row;
@@ -1179,10 +1183,8 @@ static void handleBoardTouch(int x, int y) {
     bool playerIsWhite = (playerSide == COL_WHITE);
     if (x < boardOriginX || x >= boardOriginX + 8 * squareSize) return;
     if (y < boardOriginY || y >= boardOriginY + 8 * squareSize) return;
-    int col = (x - boardOriginX) / squareSize;
-    int row = (y - boardOriginY) / squareSize;
-    int file = playerIsWhite ? col : (7 - col);
-    int rank = playerIsWhite ? (7 - row) : row;
+    int file = screenXtoFile(x, playerIsWhite);
+    int rank = screenYtoRank(y, playerIsWhite);
     int sq = sqOf(file, rank);
 
     if (selectedSq >= 0) {
