@@ -31,7 +31,7 @@
 APP_NAME("Chess")
 APP_DESCRIPTION("A simple chess ai to play against")
 APP_AUTHOR("DeceasedSnake82")
-APP_VERSION("1.0.0")
+APP_VERSION("1.0.1")
 
 // ----------------------------------------------------------------------------
 // Sprites (16x16, 1bpp packed into 16 bits/row, bit 15 = leftmost pixel)
@@ -1069,7 +1069,7 @@ static void drawBoard() {
 
     for (int row = 0; row < 8; ++row) {
         for (int col = 0; col < 8; ++col) {
-            int file = col;
+            int file = playerIsWhite ? col : (7 - col);
             int rank = playerIsWhite ? (7 - row) : row;
             int sq = sqOf(file, rank);
             int sx = boardOriginX + col * squareSize;
@@ -1181,7 +1181,7 @@ static void handleBoardTouch(int x, int y) {
     if (y < boardOriginY || y >= boardOriginY + 8 * squareSize) return;
     int col = (x - boardOriginX) / squareSize;
     int row = (y - boardOriginY) / squareSize;
-    int file = col;
+    int file = playerIsWhite ? col : (7 - col);
     int rank = playerIsWhite ? (7 - row) : row;
     int sq = sqOf(file, rank);
 
